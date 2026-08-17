@@ -1,0 +1,123 @@
+# Local Voice Conversation Agent — PRD v2
+
+## Priorities (in order)
+
+1. **Turn detection** — knows when you've stopped talking, doesn't cut you off, doesn't sit there waiting after you're done.
+2. **Response speed** — feels like a conversation, not a walkie-talkie.
+3. **Functionality** — tool calls, memory, laptop/agent orchestration actually work and are extensible.
+4. **Expressiveness** — nice to have, not a design constraint. Default to whatever voice is fastest; don't trade latency for emotion.
+
+This is a change from v1: expressiveness is explicitly deprioritized. Any component choice that trades latency or reliability for a more "human" voice is the wrong choice for this build.
+
+## Goal
+
+An always-available local conversational agent that:
+
+- listens continuously, detects turns accurately, and responds with minimal delay;
+- is interruptible without breaking state;
+- remembers prior conversations via Hindsight (`default` bank);
+- can call tools — web search, and local laptop/agent orchestration (files, shell, other agents);
+- runs fully locally and on free/open-source components.
+
+## Stack decision
+
+**Modular cascaded pipeline, not a speech-native model.** A voice-to-voice model (Moshi-class) has the best theoretical latency floor and best turn-taking naturalness, but weaker, less deterministic tool-calling, and is harder to wire into MCP/Hindsight. Since functionality and tool reliability outrank expressiveness here, a cascaded STT → LLM → TTS pipeline with a strong turn-detection layer is the right call — same conclusion as v1, but now optimized purely for speed and correctness rather than naturalness.
+
+Recommended v2:
+
+- **Pipecat** for pipeline orchestration, interruption handling, and tool lifecycle.
+- **Kyutai STT (Unmute)** for streaming transcription — kept specifically because it's tuned for low latency, not because of voice quality.
+- **A dedicated turn-detection/VAD layer**, not just "wait for silence" — see below. This is the component most likely to make or break the "feels responsive" goal, so it gets more attention than in v1.
+- **Kyutai TTS (Unmute) or Kokoro-82M** for output speech — pick whichever benchmarks faster on your hardware. Do **not** use Chatterbox or other emotion-tuned models; they're heavier and slower for no benefit against these priorities.
+- **A local tool-calling LLM via Ollama** (Qwen3-class or gpt-oss-class, whichever is faster on your machine at acceptable tool-calling accuracy — benchmark both, pick by speed once accuracy is "good enough").
+- **Hindsight MCP** for long-term memory.
+- **MCP tools** for web search, local filesystem/shell control, and orchestrating other agents on the laptop.
+
+## Recommended architecture
+
+```text
+Microphone → VAD/Turn Detector → Streaming STT → Tool-capable LLM → Streaming TTS → Speaker
+                                                    │            ▲
+                                                    └→ Hindsight + MCP tools ─┘
+```
+
+1. **Turn detection sits in front of STT, not just as a silence timer.** Use a semantic/endpoint-aware detector (not pure VAD) so the agent doesn't jump in on a mid-sentence pause and doesn't sit idle after you're clearly done. This is the single highest-leverage component for hitting priority #1.
+2. **Streaming pipeline:** Pipecat moves audio frames, cancels speech on interruption, and streams LLM text straight into TTS as it's generated — start speaking before the full response is done generating.
+3. **Agent controller:** local LLM gets stable transcript segments plus JSON tool schemas; decides respond / recall / tool-call.
+4. **Tool results** return to the same text context before response generation — deterministic, no speech-native conditioning tricks.
+5. **Memory writer:** after each exchange, store only durable facts/decisions/preferences — not raw audio, not every fragment.
+
+## Components
+
+| Component | Choice | Why |
+| --- | --- | --- |
+| Orchestrator | Pipecat (Python) | Frame pipeline, interruption, tool lifecycle |
+| Turn detection | Semantic endpointing model (e.g. a lightweight turn-detector alongside VAD) + Kyutai's "flush trick" | Accuracy and speed both matter more here than anywhere else in the pipeline |
+| Streaming STT | Kyutai STT via Unmute | Fastest local streaming option with production latency numbers |
+| Agent controller | Local tool-calling LLM via Ollama (MLX backend on Apple Silicon) | Native function calling; benchmark 2–3 models for speed/accuracy trade-off |
+| Speech output | Kyutai TTS or Kokoro-82M via Unmute | Fastest local options; explicitly not optimizing for expressiveness |
+| Memory | Hindsight MCP, `default` bank | `recall` before responses, `sync_retain` after durable facts |
+| Tools | MCP clients | Web search; filesystem/shell control; sub-agent orchestration |
+| Deferred | Moshi/MoshiRAG, Chatterbox-style emotional TTS | Only revisit if functionality and latency goals are already met and expressiveness becomes a priority later |
+
+## Controller behavior
+
+State machine, unchanged in shape from v1 but re-prioritized in tuning:
+
+```text
+LISTENING → THINKING → TOOL_RUNNING → SPEAKING
+    ▲                         │           │
+    └──────── interruption / cancellation ┘
+```
+
+- Never block audio ingestion on a tool call.
+- Turn detector — not a fixed silence timer — decides when to hand off to STT/LLM. Tune this against real conversation samples (including your own pauses/filler words) before tuning anything else.
+- Before personal questions, call Hindsight `recall` with transcript + session summary.
+- For external/current info, run the selected tool call; if it's slow, let TTS give a short filler acknowledgement rather than going silent.
+- On interruption or topic change, cancel stale generation and stale tool calls immediately — this is part of "quick response," not a separate feature.
+- Inject only compact tool/memory results (~100–300 tokens) into the LLM context to keep response generation fast.
+- Retain durable info asynchronously after turn completion, with provenance and project tags.
+
+## Tool-call contract
+
+Unchanged from v1 — it was already correctly designed for reliability over cleverness:
+
+```json
+{"type":"respond","text":"..."}
+{"type":"tool_call","name":"memory.recall","arguments":{"query":"..."}}
+{"type":"tool_call","name":"web.search","arguments":{"query":"..."}}
+{"type":"tool_call","name":"laptop.run","arguments":{"command":"..."}}
+```
+
+Policy: read-only tools run automatically; writes, sends, purchases, and destructive/system-level actions require confirmation. Log call ID, transcript span, latency, cancellation, result size, errors — this logging is what lets you actually measure whether priorities #1–#2 are being hit, so treat it as required, not optional instrumentation.
+
+## Build sequence
+
+1. **Turn detection + audio baseline first.** Before wiring the LLM or TTS, get mic → VAD/turn-detector → STT solid: correct endpointing, no clipped starts/ends, echo cancellation working. This used to be step 1 of a generic voice baseline; now it's the explicit top priority and gets its own dedicated tuning pass against real speech samples, including your own pauses and filler words.
+2. **Add LLM + TTS, measure round-trip latency.** Get the full loop running and benchmark end-to-end response time before adding any tools. This is your speed baseline — record it, since every later addition should be checked against it.
+3. **One tool:** Add Hindsight `recall`; verify it doesn't blow your latency budget.
+4. **Local orchestration tool:** Add filesystem/shell/sub-agent control via MCP, with the read-only-auto / write-needs-confirmation policy.
+5. **Web tool:** Add structured web search with cancellation and a spoken filler for long calls.
+6. **Memory writeback:** Post-turn extraction + `sync_retain`, with a strict durable-fact filter.
+7. **Latency/functionality hardening:** profile the full pipeline, fix the worst offender each pass, repeat. Only after this is solid, optionally revisit expressiveness (Moshi experiment, richer TTS) as a separate, lower-priority track.
+
+## First milestone
+
+Say something with a natural mid-sentence pause and confirm the agent doesn't jump in. Then ask, "What did we decide about the memory architecture?", get a Hindsight-grounded response, then ask it to check something on the web or run a local command — all without restarting the conversation.
+
+Target metrics (tightened from v1 since speed/turn-detection are now the explicit priority):
+
+- turn detection doesn't cut off mid-sentence pauses in test samples, and doesn't leave >500ms dead air after a real turn end;
+- interruption stops obsolete speech within 250ms;
+- memory recall/tool dispatch begins within 300ms of a stable transcript;
+- end-to-end round trip (end of user speech → start of agent speech) tracked and reported per turn, not just spot-checked;
+- no memory write occurs without passing the durable-fact filter;
+- tool-call success rate tracked per tool, since "functionality" is a named priority and needs a number attached to it, not just a vibe check.
+
+## References
+
+- [Kyutai Unmute](https://github.com/kyutai-labs/unmute)
+- [Kyutai STT](https://kyutai.org/stt/)
+- [Kyutai TTS](https://kyutai.org/tts/)
+- [Pipecat](https://github.com/pipecat-ai/pipecat)
+- [Ollama](https://ollama.com)
