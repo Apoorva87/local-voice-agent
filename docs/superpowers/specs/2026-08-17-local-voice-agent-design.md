@@ -83,28 +83,36 @@ escalation.
 
 ## 4. Model selection — measured, not assumed
 
-Benchmarked on this machine against locally available Ollama models.
 Voice latency is dominated by **time-to-first-sentence**, because
 streaming TTS cannot begin speaking mid-clause.
 
-| Model | Cold load | TTFT | First sentence | Tool accuracy | Median tool decision |
-| --- | --- | --- | --- | --- | --- |
-| **glm-4.7-flash** | 6.2 s | 149-253 ms | ~400 ms | 6/7 | 464 ms |
-| qwen3.5:35b | 9.4 s | ~260 ms | 688-890 ms | 7/7 | 1315 ms |
-| gpt-oss:120b | 18.9 s | no content emitted | - | not tested | - |
+**Methodology correction.** The first benchmark used Ollama's native
+`/api/chat` with `think: false`. That was wrong: Pipecat talks to the
+**OpenAI-compatible** `/v1` endpoint, where `think` does not exist. Re-run
+correctly, `glm-4.7-flash` returned *empty content* — every token went to
+its reasoning channel. Only `reasoning_effort="none"` disables thinking
+there; `"low"` does not. Always benchmark through the client the
+production code uses.
 
-`gpt-oss:120b` streamed zero content tokens before completion — output
-went entirely to its reasoning channel. Reasoning models are hostile to
-voice latency: the user hears silence for the whole thinking phase.
+Measured on `/v1` with `reasoning_effort="none"`:
+
+| Model | Median first sentence | Tool accuracy | Median tool decision |
+| --- | --- | --- | --- |
+| **glm-4.7-flash** | **310 ms** | 5/7 | 574 ms |
+| qwen3.5:35b | 764 ms | 7/7 | 1175 ms |
+| gpt-oss:120b | no content | not tested | - |
+
+`gpt-oss:120b` streamed zero content tokens. Reasoning models are hostile
+to voice latency: the user hears silence for the whole thinking phase.
 Rejected despite ample RAM.
 
-**Decision: `glm-4.7-flash` is the controller.** Its single tool-calling
-miss was "What's my sister's name again?" (failed to call memory recall).
-That exact weakness is already addressed by the PRD's own rule — *"Before
-personal questions, call Hindsight `recall`"* — implemented as a
-deterministic pre-LLM trigger (section 6.2). Paying qwen's 3x latency to
-recover one case the architecture handles anyway is a bad trade against
-priorities #1 and #2. `qwen3.5:35b` stays available via `LLM_MODEL`.
+**Decision: `glm-4.7-flash` is the controller.** Both its misses were
+memory lookups; it called web and shell tools correctly every time. That
+weakness is exactly what the PRD's own rule addresses — *"Before personal
+questions, call Hindsight `recall`"* — implemented as a deterministic
+pre-LLM trigger (section 6.2). Paying qwen's 2.5x latency to recover cases
+the architecture handles anyway is a bad trade against priorities #1 and
+#2. `qwen3.5:35b` stays available via `LLM_MODEL`.
 
 Both models emitted confident destructive shell commands
 (`lsof -ti:8080 | xargs kill -9`). This is direct evidence that
@@ -215,6 +223,37 @@ Targets from the PRD: <500 ms dead air after real turn end; interruption
 stops speech within 250 ms; tool dispatch begins within 300 ms of stable
 transcript.
 
+### 8.1 Measured baseline (warm, M4 Max)
+
+| Stage | Time |
+| --- | --- |
+| Turn hold (Smart Turn v3) | ~430 ms |
+| STT | ~245 ms, hidden inside the turn hold |
+| Memory recall | ~185 ms |
+| LLM to first token | ~810 ms (includes recall) |
+| TTS to first audio | ~620-830 ms |
+| **Voice-to-voice** | **~1.4-1.6 s** |
+
+This **misses the 500 ms target**. It is recorded as the honest starting
+point for build step 7, not as a goal already met.
+
+**Stage boundaries are not sequential.** A segmented STT begins on
+`VADUserStoppedSpeakingFrame` (Silero hears silence), which precedes
+`UserStoppedSpeakingFrame` (Smart Turn's verdict). Transcription therefore
+overlaps the turn-hold window rather than following it, and costs the user
+nothing. Measuring STT from turn end yields negative numbers; the
+`stt_hidden_by_turn_hold` field records whether that overlap held.
+
+Consequently the optimisation targets are the LLM and TTS stages — making
+STT faster buys nothing until it exceeds the turn hold. Candidate levers,
+in rough order of expected value:
+
+1. Overlap memory recall with the turn hold rather than blocking after it.
+2. Shrink the per-turn prompt. Tool schemas and the system prompt are
+   reprocessed every turn, and TTFT here (810 ms) is far above the 310 ms
+   measured with a bare prompt.
+3. Emit the first TTS chunk on a shorter prefix than a full sentence.
+
 ## 9. Build order
 
 Follows the PRD sequence.
@@ -236,6 +275,19 @@ Follows the PRD sequence.
 - Native audio I/O with a purpose-built AEC
 - Hibiki-Zero (wrong category, wrong hardware)
 
+## 10.1 Status against the build order
+
+Steps 1-5 are implemented and verified. Step 6 is partially done: the
+durable-fact filter exists and is tested, but nothing calls it after a turn
+yet. Step 7 has not started — section 8.1 is its input.
+
+Turn detection has been verified structurally (Smart Turn v3 holds the turn
+~430 ms past VAD silence) but **not yet tuned against real speech**. The
+PRD's first milestone — a natural mid-sentence pause that the agent does
+not interrupt — requires a human talking to it, and synthetic speech cannot
+stand in: it has none of the pauses, filler words or room noise that make
+endpointing hard.
+
 ## 11. Known issues
 
 `pipecat-ai[mlx-whisper]` alone cannot import
@@ -243,3 +295,13 @@ Follows the PRD sequence.
 import raises, despite an in-file comment stating MLX is imported lazily.
 Workaround: also install the `whisper` extra. Both extras are pinned in
 `pyproject.toml`.
+
+**Port 8888 is unusable for Hindsight on this machine.** another service may hold
+`127.0.0.1:8888` while Hindsight binds the wildcard, so `localhost`
+resolves to Jupyter and every MCP call returns 403 from a TornadoServer.
+`scripts/start_hindsight.sh` uses 8899.
+
+**Hindsight's extraction model must not be a reasoning model.** It parses
+JSON out of its LLM; thinking tokens break that with a `JSONDecodeError`,
+so `sync_retain` fails. The start script uses `llama3.2:3b`, which also
+keeps background extraction off the GPU serving the voice model.
