@@ -96,8 +96,11 @@ class MemorySettings:
     """Hindsight MCP. Local embedded Postgres, no data leaves the machine."""
 
     enabled: bool = field(default_factory=lambda: _env_bool("MEMORY_ENABLED", True))
+    # Not Hindsight's default 8888: another service may hold, and it
+    # binds 127.0.0.1 while Hindsight binds the wildcard, so "localhost"
+    # silently resolves to Jupyter and every MCP call 403s.
     url: str = field(
-        default_factory=lambda: os.getenv("HINDSIGHT_URL", "http://localhost:8888/mcp/")
+        default_factory=lambda: os.getenv("HINDSIGHT_URL", "http://127.0.0.1:8899/mcp")
     )
     bank: str = field(default_factory=lambda: os.getenv("HINDSIGHT_BANK", "default"))
     # PRD: keep injected context compact so response generation stays fast.

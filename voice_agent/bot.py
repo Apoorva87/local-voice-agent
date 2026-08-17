@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from loguru import logger
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -16,8 +18,10 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
+from voice_agent.memory import MemoryClient
 from voice_agent.metrics import TurnMetricsObserver
 from voice_agent.prompts import GREETING, SYSTEM_PROMPT
+from voice_agent.recall_processor import MemoryRecallProcessor
 from voice_agent.services import (
     build_llm,
     build_stt,
@@ -26,6 +30,7 @@ from voice_agent.services import (
     build_vad_processor,
 )
 from voice_agent.settings import Settings, load_settings
+from voice_agent.warmup import warm_all
 
 
 def build_transport_params() -> TransportParams:
@@ -50,19 +55,27 @@ async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None
     vad = build_vad_processor(settings)
     turn_strategies = build_turn_strategies(settings)
 
+    memory = MemoryClient(settings)
+    await memory.connect()  # degrades gracefully if Hindsight is not running
+
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(user_turn_strategies=turn_strategies),
     )
 
+    metrics = TurnMetricsObserver(log_dir=settings.log_dir) if settings.metrics_enabled else None
+    observers = [metrics] if metrics else []
+
     pipeline = Pipeline(
         [
             transport.input(),
             # VAD sits first so barge-in is detected the instant audio arrives,
-            # rather than waiting for anything downstream.
+            # and because segmented STT keys off its speech frames.
             vad,
             stt,
+            # Recall runs on the settled transcript, before the model sees it.
+            MemoryRecallProcessor(memory, metrics),
             aggregators.user(),
             llm,
             tts,
@@ -70,10 +83,6 @@ async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None
             aggregators.assistant(),
         ]
     )
-
-    observers = []
-    if settings.metrics_enabled:
-        observers.append(TurnMetricsObserver(log_dir=settings.log_dir))
 
     task = PipelineTask(
         pipeline,
@@ -91,6 +100,9 @@ async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None
         # deterministic, and it skips an LLM round trip at connect time.
         logger.info("Client connected; greeting and starting to listen")
         await task.queue_frames([TTSSpeakFrame(GREETING)])
+        # Load model weights while the greeting plays, so the user's first
+        # sentence is not the one that pays cold-start cost.
+        asyncio.create_task(warm_all(settings))
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(_transport, _client):
@@ -98,7 +110,10 @@ async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        await memory.close()
 
 
 async def bot(runner_args: RunnerArguments) -> None:
