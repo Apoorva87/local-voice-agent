@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
 from loguru import logger
 from pipecat.frames.frames import TTSSpeakFrame
@@ -30,6 +31,7 @@ from voice_agent.services import (
     build_vad_processor,
 )
 from voice_agent.settings import Settings, load_settings
+from voice_agent.tools.registry import build_tools_schema, register_tools
 from voice_agent.warmup import warm_all
 
 
@@ -47,8 +49,23 @@ def build_transport_params() -> TransportParams:
     )
 
 
-async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None:
-    """Wire the pipeline and run it until the client disconnects."""
+@dataclass
+class Core:
+    """The agent minus its transport.
+
+    Split out so the whole pipeline -- turn detection, STT, recall, LLM, tools
+    and TTS -- can be exercised headlessly by feeding it audio frames, without
+    a browser or a microphone. See ``scripts/check_pipeline.py``.
+    """
+
+    processors: list  # everything between audio in and audio out
+    aggregators: LLMContextAggregatorPair
+    memory: MemoryClient
+    metrics: TurnMetricsObserver | None
+
+
+async def build_core(settings: Settings) -> Core:
+    """Build every stage of the agent except the transport."""
     stt = build_stt(settings)
     llm = build_llm(settings)
     tts = build_tts(settings)
@@ -58,18 +75,20 @@ async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None
     memory = MemoryClient(settings)
     await memory.connect()  # degrades gracefully if Hindsight is not running
 
-    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+    context = LLMContext(
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+        tools=build_tools_schema(),
+    )
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(user_turn_strategies=turn_strategies),
     )
 
     metrics = TurnMetricsObserver(log_dir=settings.log_dir) if settings.metrics_enabled else None
-    observers = [metrics] if metrics else []
+    register_tools(llm, metrics)
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
+    return Core(
+        processors=[
             # VAD sits first so barge-in is detected the instant audio arrives,
             # and because segmented STT keys off its speech frames.
             vad,
@@ -79,6 +98,23 @@ async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None
             aggregators.user(),
             llm,
             tts,
+        ],
+        aggregators=aggregators,
+        memory=memory,
+        metrics=metrics,
+    )
+
+
+async def run_agent(transport: SmallWebRTCTransport, settings: Settings) -> None:
+    """Wire the pipeline and run it until the client disconnects."""
+    core = await build_core(settings)
+    memory, metrics, aggregators = core.memory, core.metrics, core.aggregators
+    observers = [metrics] if metrics else []
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            *core.processors,
             transport.output(),
             aggregators.assistant(),
         ]

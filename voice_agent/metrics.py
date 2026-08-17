@@ -23,8 +23,9 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     InterruptionFrame,
-    LLMFullResponseStartFrame,
+    LLMTextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
@@ -56,19 +57,41 @@ class TurnRecord:
     tools: list[dict] = field(default_factory=list)
 
     def summary(self) -> dict:
-        """Durations that matter, derived from raw timestamps."""
+        """Durations that matter, derived from raw timestamps.
+
+        The stage boundaries are not the naive sequential ones. A segmented
+        STT starts transcribing when *VAD* hears silence, which is earlier
+        than when *Smart Turn* declares the turn over -- so transcription
+        overlaps the turn-hold window instead of following it. Measuring
+        ``stt_ms`` from turn end yields negative numbers and hides the fact
+        that STT is usually free.
+        """
+        # The LLM cannot start until both the turn is over and the transcript
+        # exists, whichever lands later.
+        llm_start = max(
+            (t for t in (self.speech_ended_at, self.transcript_at) if t is not None),
+            default=None,
+        )
+        stt_hidden = (
+            self.transcript_at is not None
+            and self.speech_ended_at is not None
+            and self.transcript_at <= self.speech_ended_at
+        )
         return {
             "turn": self.turn,
             "transcript": self.transcript,
             # The headline number: user stops talking -> agent starts talking.
             "voice_to_voice_ms": _ms(self.speech_ended_at, self.bot_audio_at),
             # How long Smart Turn v3 held the turn open after Silero first
-            # heard silence. This is the cost of *not* cutting the user off,
+            # heard silence. This is the price of *not* cutting the user off,
             # and the number to tune when the agent feels sluggish or jumpy.
             "turn_hold_ms": _ms(self.vad_silence_at, self.speech_ended_at),
-            # Where that time went.
-            "stt_ms": _ms(self.speech_ended_at, self.transcript_at),
-            "llm_ttft_ms": _ms(self.transcript_at, self.llm_first_token_at),
+            # Transcription time, measured from when STT actually began.
+            "stt_ms": _ms(self.vad_silence_at, self.transcript_at),
+            # True when transcription finished inside the turn-hold window,
+            # meaning it cost the user nothing.
+            "stt_hidden_by_turn_hold": stt_hidden,
+            "llm_ttft_ms": _ms(llm_start, self.llm_first_token_at),
             "tts_ms": _ms(self.llm_first_token_at, self.bot_audio_at),
             "user_speech_ms": _ms(self.speech_started_at, self.speech_ended_at),
             "bot_speech_ms": _ms(self.bot_audio_at, self.bot_done_at),
@@ -129,6 +152,14 @@ class TurnMetricsObserver(BaseObserver):
                 f"tts {record['tts_ms']}ms)"
             )
 
+    def reset(self) -> None:
+        """Drop the turn in progress without logging it.
+
+        Used by the headless check to discard the startup greeting, which is
+        not a user turn and would otherwise be written as one.
+        """
+        self._current = None
+
     def record_tool(self, name: str, latency_ms: float, ok: bool, note: str = "") -> None:
         """Called by the tool layer; the PRD requires per-tool success tracking."""
         if self._current is not None:
@@ -173,11 +204,17 @@ class TurnMetricsObserver(BaseObserver):
                 self._current.transcript_at = now
                 self._current.transcript = (frame.text or "").strip()
 
-        elif isinstance(frame, LLMFullResponseStartFrame):
+        elif isinstance(frame, LLMTextFrame):
+            # LLMTextFrame, not LLMFullResponseStartFrame: the latter fires
+            # when generation is dispatched, which makes TTFT look like ~1ms
+            # and pushes the real wait into the TTS bucket.
             if self._current is not None and self._current.llm_first_token_at is None:
                 self._current.llm_first_token_at = now
 
-        elif isinstance(frame, BotStartedSpeakingFrame):
+        elif isinstance(frame, (BotStartedSpeakingFrame, TTSAudioRawFrame)):
+            # TTSAudioRawFrame too: BotStartedSpeakingFrame is emitted by the
+            # output transport, so headless runs would otherwise never record
+            # the moment the agent starts speaking.
             if self._current is not None and self._current.bot_audio_at is None:
                 self._current.bot_audio_at = now
 

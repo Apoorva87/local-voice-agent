@@ -51,9 +51,35 @@ async def warm_stt(settings: Settings) -> None:
     )
 
 
+async def warm_tts(settings: Settings) -> None:
+    """Load Kokoro's ONNX session and its voice pack.
+
+    Measured: the first synthesis in a process costs well over a second,
+    which lands directly in voice-to-voice latency because TTS is the last
+    stage before the user hears anything. Every later call is far cheaper.
+    """
+    from kokoro_onnx import Kokoro
+    from pipecat.services.kokoro.tts import KOKORO_CACHE_DIR
+
+    model = KOKORO_CACHE_DIR / "kokoro-v1.0.onnx"
+    voices = KOKORO_CACHE_DIR / "voices-v1.0.bin"
+    if not model.exists() or not voices.exists():
+        return  # first run downloads them; nothing to warm yet
+
+    def _run() -> None:
+        kokoro = Kokoro(str(model), str(voices))
+        kokoro.create("Ready.", voice=settings.models.tts_voice, lang="en-us", speed=1.0)
+
+    await asyncio.to_thread(_run)
+
+
 async def warm_all(settings: Settings) -> None:
     """Warm every model. A failure here is logged, never fatal."""
-    tasks = {"llm": warm_llm(settings), "stt": warm_stt(settings)}
+    tasks = {
+        "llm": warm_llm(settings),
+        "stt": warm_stt(settings),
+        "tts": warm_tts(settings),
+    }
     t0 = time.perf_counter()
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     for name, result in zip(tasks, results):
