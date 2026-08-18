@@ -3,9 +3,10 @@
 #
 # Two settings here are load-bearing:
 #
-#   Port 8899, not Hindsight's default 8888. another service may hold 8888 on
-#   127.0.0.1 while Hindsight binds the wildcard, so "localhost" silently
-#   resolves to Jupyter and every MCP call returns 403.
+#   Port 8899, not Hindsight's default 8888, which is a common conflict
+#   (Jupyter uses it too). If another service already holds 127.0.0.1:8888
+#   while Hindsight binds the wildcard, "localhost" resolves to that service
+#   and every MCP call returns 403.
 #
 #   llama3.2:3b, not the conversation model. Hindsight parses JSON out of its
 #   extraction LLM, and reasoning models (glm-4.7-flash, qwen3.5) emit

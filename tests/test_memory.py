@@ -67,8 +67,8 @@ class TestCompactRecall:
         assert "scores" not in out and "0.31" not in out
 
     def test_strips_provenance_suffix(self):
-        raw = self._payload("Uses the default bank | When: Monday | Involving: user")
-        assert compact_recall(raw, 1000) == "- Uses the default bank"
+        raw = self._payload("Uses the project bank | When: Monday | Involving: user")
+        assert compact_recall(raw, 1000) == "- Uses the project bank"
 
     def test_deduplicates_repeated_facts(self):
         # Hindsight returns the same fact as both an observation and a world
@@ -79,8 +79,8 @@ class TestCompactRecall:
     def test_deduplicates_near_identical_facts(self):
         """Observed live: the same fact with and without a trailing period."""
         raw = self._payload(
-            "Memory architecture uses Hindsight MCP with default bank.",
-            "Memory architecture uses Hindsight MCP with default bank",
+            "Memory architecture uses Hindsight MCP with project bank.",
+            "Memory architecture uses Hindsight MCP with project bank",
             "Unmute rejected because it is CUDA only",
         )
         out = compact_recall(raw, 1000)

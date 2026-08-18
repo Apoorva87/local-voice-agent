@@ -76,7 +76,7 @@ not needed at all — that removed an entire Docker tier from the design.
 | STT | MLX Whisper large-v3-turbo-q4 | Runs on the Apple Silicon GPU |
 | LLM | glm-4.7-flash via Ollama | Fastest to first *sentence* (see below) |
 | TTS | Kokoro-82M (ONNX) | Fastest local option |
-| Memory | Hindsight, bank `default` | Local embedded Postgres |
+| Memory | Hindsight (local MCP) | Local embedded Postgres |
 
 **Hibiki-Zero was evaluated and rejected.** It is a speech-to-speech
 *translation* model (French/Spanish/Portuguese/German → English) and needs an
@@ -100,7 +100,7 @@ on the model choosing to look.
 
 ### Current latency baseline
 
-Measured by `check_pipeline.py`, warm, on an M4 Max:
+Measured by `check_pipeline.py`, warm, on an Apple M4 Max:
 
 | Stage | Time |
 | --- | --- |
@@ -154,14 +154,16 @@ Notable ones:
 - `TURN_LLM_GATE` — adds an LLM veto on end-of-turn. Stronger protection
   against being cut off mid-sentence, at the cost of a round trip. Off by
   default; turn it on if turn detection cuts you off in practice.
-- `HINDSIGHT_BANK` — which memory bank to use
+- `HINDSIGHT_BANK` — which memory bank to use (created on first use)
 
 ## Known issues
 
-**Port 8888 is not usable for Hindsight on this machine.** another service may hold
-`127.0.0.1:8888` while Hindsight binds the wildcard, so `localhost` resolves
-to Jupyter and every MCP call returns 403. `scripts/start_hindsight.sh` uses
-8899.
+**Hindsight runs on port 8899, not its default 8888.** Port 8888 is a
+common conflict (it is a common default). If another service already holds
+`127.0.0.1:8888` while Hindsight binds the wildcard, `localhost` resolves to
+that service and every MCP call returns 403 — a confusing failure, since
+Hindsight's own log still says it started. `scripts/start_hindsight.sh`
+avoids it.
 
 **Hindsight's extraction model must not be a reasoning model.** It parses
 JSON out of its LLM, and thinking tokens break that parse with a

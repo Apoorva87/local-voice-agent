@@ -65,7 +65,7 @@ class TurnSettings:
 
 @dataclass(frozen=True)
 class ModelSettings:
-    """Model choices. Defaults are the measured winners on M4 Max."""
+    """Model choices. Defaults are the fastest measured on Apple Silicon."""
 
     # Chosen on measured TTFT (149-253ms) and first-sentence (~400ms).
     llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "glm-4.7-flash:latest"))
@@ -96,12 +96,14 @@ class MemorySettings:
     """Hindsight MCP. Local embedded Postgres, no data leaves the machine."""
 
     enabled: bool = field(default_factory=lambda: _env_bool("MEMORY_ENABLED", True))
-    # Not Hindsight's default 8888: another service may hold, and it
-    # binds 127.0.0.1 while Hindsight binds the wildcard, so "localhost"
-    # silently resolves to Jupyter and every MCP call 403s.
+    # 8899 rather than Hindsight's default 8888, which is a frequent
+    # conflict. If another service already holds 127.0.0.1:8888 while
+    # Hindsight binds the wildcard, "localhost" resolves to the other
+    # service and every MCP call returns 403.
     url: str = field(
         default_factory=lambda: os.getenv("HINDSIGHT_URL", "http://127.0.0.1:8899/mcp")
     )
+    # No default: a memory bank is per-user state, not a project setting.
     bank: str = field(default_factory=lambda: os.getenv("HINDSIGHT_BANK", "default"))
     # PRD: keep injected context compact so response generation stays fast.
     recall_budget_tokens: int = field(

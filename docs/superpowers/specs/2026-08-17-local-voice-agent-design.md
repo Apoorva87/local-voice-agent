@@ -15,14 +15,13 @@ The PRD's *priorities* are unchanged and still govern every decision:
 3. Functionality (tools, memory)
 4. Expressiveness (explicitly not a constraint)
 
-## 2. Target hardware
+## 2. Target platform
 
-| Property | Value |
-| --- | --- |
-| Machine | Apple M4 Max |
-| Memory | unified memory |
-| OS | macOS on Apple Silicon |
-| Arch | arm64 (aarch64) |
+Apple Silicon (arm64) on macOS. Every component must run natively on the
+GPU or CPU of an M-series chip; nothing may assume CUDA or x86_64.
+
+Benchmark numbers in this document were measured on an M4 Max, and are
+quoted only so the latency figures can be interpreted.
 
 ## 3. Verified findings that change the PRD
 
@@ -129,7 +128,7 @@ Both models emitted confident destructive shell commands
 | STT | `WhisperSTTServiceMLX` (`LARGE_V3_TURBO_Q4`) | Apple Silicon MLX |
 | LLM | `OLLamaLLMService`, `glm-4.7-flash` | OpenAI-compatible at :11434/v1 |
 | TTS | `KokoroTTSService` (kokoro-onnx) | Fastest local; expressiveness not a goal |
-| Memory | Hindsight local MCP, bank `default` | Embedded Postgres, fully local |
+| Memory | Hindsight local MCP | Embedded Postgres, fully local |
 | Tools | `MCPClient` + native function schemas | Policy-gated (section 7) |
 
 ### 5.1 Transport rationale
@@ -296,10 +295,11 @@ import raises, despite an in-file comment stating MLX is imported lazily.
 Workaround: also install the `whisper` extra. Both extras are pinned in
 `pyproject.toml`.
 
-**Port 8888 is unusable for Hindsight on this machine.** another service may hold
-`127.0.0.1:8888` while Hindsight binds the wildcard, so `localhost`
-resolves to Jupyter and every MCP call returns 403 from a TornadoServer.
-`scripts/start_hindsight.sh` uses 8899.
+**Hindsight must not use its default port 8888.** It is a common
+conflict (it is a common default). If another service holds
+`127.0.0.1:8888` while Hindsight binds the wildcard, `localhost` resolves
+to that service and every MCP call returns 403 — while Hindsight's own log
+still reports a successful start. `scripts/start_hindsight.sh` uses 8899.
 
 **Hindsight's extraction model must not be a reasoning model.** It parses
 JSON out of its LLM; thinking tokens break that with a `JSONDecodeError`,
