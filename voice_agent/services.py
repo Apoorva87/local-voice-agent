@@ -112,8 +112,31 @@ def build_llm(settings: Settings) -> OLLamaLLMService:
     # token budget on reasoning, returning empty content -- silence, to a
     # listener. Passed via `extra`, which merges into the request body.
     extra: dict[str, object] = {}
+    max_tokens = models.llm_max_tokens
     if models.llm_reasoning_effort:
         extra["reasoning_effort"] = models.llm_reasoning_effort
+
+    thinking_on = models.llm_reasoning_effort not in ("none", "")
+    if thinking_on:
+        # Reasoning tokens are drawn from the same budget as the answer.
+        # Measured on glm-4.7-flash: ~1600 characters of reasoning before the
+        # first content token, which swallows a 300-token budget entirely and
+        # returns an empty reply -- silence, to a listener. Raise the floor so
+        # enabling thinking degrades to "slow" rather than "mute".
+        floor = 1200
+        if max_tokens < floor:
+            logger.warning(
+                f"Thinking is enabled (reasoning_effort={models.llm_reasoning_effort!r}) "
+                f"but LLM_MAX_TOKENS={max_tokens} is too low; reasoning would consume "
+                f"the whole budget and the reply would come back empty. "
+                f"Raising to {floor} for this run."
+            )
+            max_tokens = floor
+        logger.warning(
+            "Thinking is enabled. Expect multiple seconds of silence before the "
+            "agent speaks (measured ~5s at reasoning_effort=high, versus ~470ms "
+            "with it off). Set LLM_REASONING_EFFORT=none to restore low latency."
+        )
 
     logger.info(
         f"LLM: {models.llm_model} at {models.llm_base_url} "
@@ -124,7 +147,7 @@ def build_llm(settings: Settings) -> OLLamaLLMService:
         settings=OLLamaLLMService.Settings(
             model=models.llm_model,
             temperature=models.llm_temperature,
-            max_tokens=models.llm_max_tokens,
+            max_tokens=max_tokens,
             extra=extra,
         ),
     )
